@@ -521,7 +521,8 @@ class QEPotential(_PotentialBuilder):
 
     @property
     def num_configurations(self):
-        return self.frozen_phonons.num_configs
+        n = self.frozen_phonons.num_configs
+        return 1 if n is None else n
 
     @property
     def repetitions(self):
