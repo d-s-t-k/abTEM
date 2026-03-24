@@ -65,7 +65,7 @@ PSEUDOPOTENTIALS = {
 # Simulation parameters
 # ---------------------------------------------------------------------------
 ENERGY = 200e3           # eV
-SAMPLING = 0.05          # Å  (potential grid)
+SAMPLING = 0.01          # Å  (potential grid)
 SLICE_THICKNESS = 1.0    # Å
 SUPERCELL_REP = (2, 2, 6)
 
@@ -82,7 +82,7 @@ SCAN_STEP = 0.33  # Å
 # Ptychography
 PTYCHO_SCAN_STEP = 0.33     # Å  (overlap-rich scan for ptycho)
 PTYCHO_MAX_ANGLE = 5.0      # × semiangle_cutoff
-PTYCHO_MAX_ITER = 50
+PTYCHO_MAX_ITER = 150
 PTYCHO_ROI_SHAPE = (128, 128)
 
 
@@ -209,7 +209,7 @@ def run_rpie(dataset_4d, label=""):
         semiangle_cutoff=SEMIANGLE_CUTOFF,
         region_of_interest_shape=PTYCHO_ROI_SHAPE,
         preprocess=True,
-        device="cpu",
+        device="gpu",
     )
 
     objects, probes, positions, sse = ptycho.reconstruct(
@@ -256,17 +256,18 @@ def run_qe_scf(atoms, workdir="qe_sto_scf"):
         "system": {
             "ibrav": 0,
             "ecutwfc": 80.0,
-            "occupations": "fixed",
+            "occupations": "smearing",
+            "degauss":0.02,
         },
         "electrons": {
-            "conv_thr": 1.0e-12,
+            "conv_thr": 1.0e-10,
             "electron_maxstep": 300,
             "mixing_beta": 0.5,
             "diagonalization": "david",
         },
     }
 
-    kpts = (1, 1, 1)
+    kpts = (2,2,2)
 
     calc = Espresso(
         profile=profile,
@@ -307,6 +308,27 @@ def save_results(output_path, results):
         Nested dict of results produced by main().
     """
     with h5py.File(output_path, "w") as h5:
+        # --- Projected potentials ---
+        if "potential" in results:
+            grp = h5.create_group("potential")
+            grp.attrs["sampling_angstrom"] = SAMPLING
+            grp.attrs["slice_thickness_angstrom"] = SLICE_THICKNESS
+            grp.attrs["units"] = "eV/e"
+
+            for tag, proj in results["potential"].items():
+                if proj is not None:
+                    _write_array(h5, f"potential/{tag}", proj)
+
+            p_iam = results["potential"].get("iam")
+            p_qe = results["potential"].get("qe")
+            if p_iam is not None and p_qe is not None:
+                a_iam = p_iam.array.squeeze()
+                a_qe = p_qe.array.squeeze()
+                common = tuple(min(x, y) for x, y in zip(a_iam.shape, a_qe.shape))
+                diff = a_iam[:common[0], :common[1]] - a_qe[:common[0], :common[1]]
+                h5.create_dataset("potential/difference", data=diff,
+                                  compression="gzip")
+
         # --- HAADF ---
         if "haadf" in results:
             grp = h5.create_group("haadf")
@@ -372,6 +394,60 @@ def save_results(output_path, results):
 # ===================================================================
 # Plotting
 # ===================================================================
+
+def plot_potentials(results, savefig="abtem_sto_potentials.png"):
+    """Plot projected electrostatic potentials: IAM, QE, and difference."""
+    pot = results.get("potential", {})
+    iam = pot.get("iam")
+    qe = pot.get("qe")
+
+    panels = []
+    if iam is not None:
+        panels.append(("Lobato IAM", iam.array.squeeze()))
+    if qe is not None:
+        panels.append(("Quantum ESPRESSO", qe.array.squeeze()))
+    if iam is not None and qe is not None:
+        a_iam = iam.array.squeeze()
+        a_qe = qe.array.squeeze()
+        common = tuple(min(x, y) for x, y in zip(a_iam.shape, a_qe.shape))
+        diff = a_iam[:common[0], :common[1]] - a_qe[:common[0], :common[1]]
+        panels.append(("IAM \u2212 QE", diff))
+
+    if not panels:
+        return
+
+    ncols = len(panels)
+    fig, axes = plt.subplots(1, ncols, figsize=(5.5 * ncols, 4.5))
+    if ncols == 1:
+        axes = [axes]
+
+    # Use a common color scale for IAM and QE (not the diff)
+    pot_arrays = [p[1] for p in panels if "\u2212" not in p[0]]
+    if pot_arrays:
+        vmin = min(a.min() for a in pot_arrays)
+        vmax = max(a.max() for a in pot_arrays)
+    else:
+        vmin, vmax = None, None
+
+    for idx, (title, arr) in enumerate(panels):
+        if "\u2212" in title:
+            dlim = max(abs(arr.min()), abs(arr.max()))
+            im = axes[idx].imshow(
+                arr, cmap="RdBu_r", vmin=-dlim, vmax=dlim, origin="lower",
+            )
+        else:
+            im = axes[idx].imshow(
+                arr, cmap="viridis", vmin=vmin, vmax=vmax, origin="lower",
+            )
+        axes[idx].set_title(title)
+        fig.colorbar(im, ax=axes[idx], fraction=0.046, pad=0.04,
+                     label="V (eV/e)" if "\u2212" not in title else "\u0394V (eV/e)")
+
+    fig.suptitle("SrTiO\u2083 Projected Electrostatic Potential", fontsize=14)
+    fig.tight_layout()
+    fig.savefig(savefig, dpi=200, bbox_inches="tight")
+    print(f"  Figure saved to {savefig}")
+
 
 def plot_haadf(results, savefig="abtem_sto_haadf.png"):
     iam = results["haadf"].get("iam")
@@ -473,7 +549,7 @@ def main():
     )
     args = parser.parse_args()
 
-    results = {"haadf": {}, "4dstem": {}, "rpie": {}}
+    results = {"haadf": {}, "4dstem": {}, "rpie": {}, "potential": {}}
 
     # --- Structure ---
     print("Reading SrTiO3 and building supercell …")
@@ -483,6 +559,14 @@ def main():
 
     # --- IAM potential ---
     iam_pot = _potential_iam(supercell)
+
+    # ================= PROJECTED POTENTIALS =================
+    print("\n===== Projected Potentials =====")
+    print("  --- IAM (Lobato) ---")
+    iam_proj = iam_pot.build().project().compute()
+    results["potential"]["iam"] = iam_proj
+    print(f"  IAM potential range: [{float(iam_proj.array.min()):.2f}, "
+          f"{float(iam_proj.array.max()):.2f}] eV/e")
 
     # ================= HAADF =================
     print("\n===== HAADF-STEM =====")
@@ -496,6 +580,13 @@ def main():
         print(f"  Total energy: {scf_atoms.get_potential_energy():.6f} eV")
 
         qe_pot = _potential_qe(args.workdir)
+
+        print("  --- QE projected potential ---")
+        qe_proj = qe_pot.build().project().compute()
+        results["potential"]["qe"] = qe_proj
+        print(f"  QE potential range: [{float(qe_proj.array.min()):.2f}, "
+              f"{float(qe_proj.array.max()):.2f}] eV/e")
+
         print("  --- QE ---")
         results["haadf"]["qe"] = run_haadf(qe_pot, label="QE")
 
@@ -523,6 +614,7 @@ def main():
     # ================= PLOTS =================
     if not args.no_plots:
         print("\n===== Generating figures =====")
+        plot_potentials(results)
         plot_haadf(results)
         if not args.skip_ptycho:
             plot_ptycho(results)
