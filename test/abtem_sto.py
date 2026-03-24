@@ -68,20 +68,19 @@ ENERGY = 200e3           # eV
 SAMPLING = 0.01          # Å  (potential grid)
 SLICE_THICKNESS = 1.0    # Å
 
-# QE is run on a 1×1×10 cell (1 primitive cell in XY, 10 in Z).
-# k-points (10,10,1) give equivalent sampling to 10×10×10 on the primitive cell.
-QE_CELL_REP = (1, 1, 10)  # supercell for the QE SCF run
-QE_KPTS = (10, 10, 1)     # k-point mesh for the QE supercell
+# QE is run on the primitive cell with a dense 10×10×10 k-point mesh.
+QE_CELL_REP = (1, 1, 1)   # SCF on the primitive unit cell
+QE_KPTS = (10, 10, 10)    # dense k-mesh for the primitive cell
 
-# The QEPotential tiles the DFT result to match the full multislice cell:
-QE_TILE_REP = (2, 2, 1)   # tile QE potential 2×2 in XY → same extent as IAM
+# QEPotential tiles the single-cell DFT result to build the multislice slab:
+QE_TILE_REP = (1, 1, 10)  # 1×1×10 slab for the electron beam to traverse
 
-# IAM uses the equivalent full supercell (QE_CELL_REP × QE_TILE_REP in XY):
+# IAM supercell matches the tiled QE extent exactly:
 SUPERCELL_REP = (
     QE_CELL_REP[0] * QE_TILE_REP[0],
     QE_CELL_REP[1] * QE_TILE_REP[1],
-    QE_CELL_REP[2],
-)  # = (2, 2, 10)
+    QE_CELL_REP[2] * QE_TILE_REP[2],
+)  # = (1, 1, 10)
 
 # STEM probe
 SEMIANGLE_CUTOFF = 21.4  # mrad  (convergence semi-angle)
