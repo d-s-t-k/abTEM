@@ -27,7 +27,6 @@ from abtem.inelastic.phonons import (
     BaseFrozenPhonons,
     DummyFrozenPhonons,
     FrozenPhonons,
-    _safe_read_atoms,
 )
 from abtem.parametrizations import EwaldParametrization
 from abtem.potentials.charge_density import _interpolate_slice
@@ -38,6 +37,43 @@ try:
 except ImportError:
     Espresso = None
     EspressoProfile = None
+
+
+def _read_atoms_qe(calculator, prefix: str = "pwscf") -> Atoms:
+    """Read atoms from a QE calculator or working directory."""
+    if isinstance(calculator, Atoms):
+        atoms = calculator
+    elif isinstance(calculator, str):
+        # Directory path – try QE output, then input
+        pwo = os.path.join(calculator, "espresso.pwo")
+        pwi = os.path.join(calculator, "espresso.pwi")
+        xml = os.path.join(calculator, f"{prefix}.save", "data-file-schema.xml")
+        if os.path.isfile(pwo):
+            from ase.io import read
+            atoms = read(pwo, format="espresso-out")
+        elif os.path.isfile(xml):
+            from ase.io import read
+            atoms = read(xml, format="espresso-out")
+        elif os.path.isfile(pwi):
+            from ase.io import read
+            atoms = read(pwi, format="espresso-in")
+        else:
+            raise FileNotFoundError(
+                f"Could not find QE output in '{calculator}'. "
+                "Expected espresso.pwo, espresso.pwi, or "
+                f"{prefix}.save/data-file-schema.xml."
+            )
+    elif hasattr(calculator, "atoms"):
+        atoms = calculator.atoms
+    else:
+        raise TypeError(
+            f"Cannot read atoms from {type(calculator)}. "
+            "Expected an Atoms object, a directory path, or a calculator."
+        )
+    atoms = atoms.copy()
+    atoms.constraints = None
+    atoms.calc = None
+    return atoms
 
 
 def _run_pp_x(
@@ -260,19 +296,7 @@ class _DummyQE:
             )
 
         if atoms is None:
-            from ase.io.espresso import read_espresso_out
-
-            xml_path = os.path.join(path, f"{prefix}.save", "data-file-schema.xml")
-            if os.path.isfile(xml_path):
-                from ase.io.espresso import read_fortran_namelist
-                from ase.io import read
-
-                atoms = read(xml_path, format="espresso-out")
-            else:
-                raise FileNotFoundError(
-                    f"Could not find QE XML output at {xml_path}. "
-                    "Pass `atoms` explicitly."
-                )
+            atoms = _read_atoms_qe(path, prefix=prefix)
 
         potential = _extract_potential_from_qe(
             outdir=path,
@@ -442,7 +466,7 @@ class QEPotential(_PotentialBuilder):
         qe_kwargs = dict(pp_command=pp_command, plot_num=plot_num)
 
         if isinstance(calculators, (tuple, list)):
-            atoms = _safe_read_atoms(calculators[0])
+            atoms = _read_atoms_qe(calculators[0])
             num_configs = len(calculators)
 
             if frozen_phonons is not None:
@@ -459,7 +483,7 @@ class QEPotential(_PotentialBuilder):
             frozen_phonons = DummyFrozenPhonons(atoms, num_configs=num_configs)
 
         else:
-            atoms = _safe_read_atoms(calculators)
+            atoms = _read_atoms_qe(calculators)
 
             calculators = _DummyQE.from_generic(calculators, **qe_kwargs)
 
