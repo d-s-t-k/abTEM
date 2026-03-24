@@ -159,7 +159,7 @@ def _extract_potential_from_qe(
     plot_num: int = 11,
 ) -> np.ndarray:
     """
-    Extract the electrostatic potential from a completed QE calculation.
+    Extract a single potential quantity from a completed QE calculation.
 
     Parameters
     ----------
@@ -193,6 +193,71 @@ def _extract_potential_from_qe(
         potential = _read_potential_cube(fileout)
 
     return potential
+
+
+def _extract_electronic_potential_from_qe(
+    outdir: str,
+    prefix: str,
+    pp_command: str = "pp.x",
+) -> np.ndarray:
+    """
+    Extract the electronic-only potential (V_Hartree + V_xc) from QE.
+
+    Two ``pp.x`` calls are made:
+
+    * ``plot_num=11`` → V_bare + V_Hartree + V_xc  (total local potential)
+    * ``plot_num=1``  → V_bare                     (bare ionic potential)
+
+    The difference gives the self-consistent electronic contribution that
+    encodes bonding effects::
+
+        V_electronic = V_total - V_bare = V_Hartree + V_xc
+
+    This mirrors the GPAW approach where the smooth Hartree potential is
+    subtracted from atom-centred PAW core corrections.
+
+    Parameters
+    ----------
+    outdir : str
+        Directory containing the QE save data.
+    prefix : str
+        QE calculation prefix.
+    pp_command : str
+        Command to invoke ``pp.x``.
+
+    Returns
+    -------
+    v_electronic : numpy.ndarray
+        3-D (V_Hartree + V_xc) in eV.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # --- V_total = V_bare + V_H + V_xc (plot_num=11) ---
+        filplot_tot = os.path.join(tmpdir, "filplot_total")
+        fileout_tot = os.path.join(tmpdir, "v_total.cube")
+        _run_pp_x(
+            pp_command=pp_command,
+            outdir=outdir,
+            prefix=prefix,
+            filplot=filplot_tot,
+            fileout=fileout_tot,
+            plot_num=11,
+        )
+        v_total = _read_potential_cube(fileout_tot)
+
+        # --- V_bare (plot_num=1) ---
+        filplot_bare = os.path.join(tmpdir, "filplot_bare")
+        fileout_bare = os.path.join(tmpdir, "v_bare.cube")
+        _run_pp_x(
+            pp_command=pp_command,
+            outdir=outdir,
+            prefix=prefix,
+            filplot=filplot_bare,
+            fileout=fileout_bare,
+            plot_num=1,
+        )
+        v_bare = _read_potential_cube(fileout_bare)
+
+    return v_total - v_bare
 
 
 def integrate_slice(array, gpts, a, b, thickness):
@@ -231,10 +296,16 @@ class _DummyQE:
     Lightweight container that stores the essential results of a converged
     Quantum ESPRESSO calculation so that the heavy calculator object does
     not have to be kept in memory.
+
+    The ``electronic_potential`` field holds V_Hartree + V_xc (the
+    self-consistent electronic contribution) obtained by subtracting
+    V_bare from V_total.  This mirrors the GPAW approach where only
+    the smooth Hartree potential is subtracted from atom-centred PAW
+    core corrections.
     """
 
     atoms: Atoms
-    electrostatic_potential: np.ndarray
+    electronic_potential: np.ndarray
     outdir: str
     prefix: str
     pseudo_dir: Optional[str] = None
@@ -245,8 +316,8 @@ class _DummyQE:
         cls,
         calculator,
         pp_command: str = "pp.x",
-        plot_num: int = 11,
         lazy: bool = True,
+        **kwargs,
     ):
         """Build from a converged ASE ``Espresso`` calculator."""
         atoms = calculator.atoms.copy()
@@ -256,16 +327,15 @@ class _DummyQE:
         outdir = params.get("outdir", calculator.directory or ".")
         prefix = params.get("prefix", "pwscf")
 
-        potential = _extract_potential_from_qe(
+        v_el = _extract_electronic_potential_from_qe(
             outdir=outdir,
             prefix=prefix,
             pp_command=pp_command,
-            plot_num=plot_num,
         )
 
         return cls(
             atoms=atoms,
-            electrostatic_potential=potential,
+            electronic_potential=v_el,
             outdir=outdir,
             prefix=prefix,
             pseudo_dir=params.get("pseudo_dir"),
@@ -279,8 +349,8 @@ class _DummyQE:
         atoms: Atoms = None,
         prefix: str = "pwscf",
         pp_command: str = "pp.x",
-        plot_num: int = 11,
         lazy: bool = True,
+        **kwargs,
     ):
         """
         Build from a QE output directory that already contains converged
@@ -292,22 +362,21 @@ class _DummyQE:
         if lazy:
             return dask.delayed(cls.from_directory)(
                 path, atoms=atoms, prefix=prefix,
-                pp_command=pp_command, plot_num=plot_num, lazy=False,
+                pp_command=pp_command, lazy=False,
             )
 
         if atoms is None:
             atoms = _read_atoms_qe(path, prefix=prefix)
 
-        potential = _extract_potential_from_qe(
+        v_el = _extract_electronic_potential_from_qe(
             outdir=path,
             prefix=prefix,
             pp_command=pp_command,
-            plot_num=plot_num,
         )
 
         return cls(
             atoms=atoms,
-            electrostatic_potential=potential,
+            electronic_potential=v_el,
             outdir=path,
             prefix=prefix,
         )
@@ -329,7 +398,7 @@ class _DummyQE:
 
 
 def _generate_slices(
-    valence_potential,
+    electronic_potential,
     atoms,
     gpts,
     slice_thickness,
@@ -340,25 +409,33 @@ def _generate_slices(
 ):
     """
     Yield potential slices by combining the Ewald (nuclear) IAM contribution
-    with the DFT valence electrostatic potential extracted from QE.
+    with the DFT electronic potential (V_Hartree + V_xc) from QE.
+
+    The Ewald potential provides the smooth nuclear contribution.
+    The electronic potential (V_H + V_xc) — obtained by subtracting V_bare
+    from V_total via two pp.x calls — is subtracted so that only the
+    self-consistent electronic correction modifies the IAM baseline.
+
+    This mirrors the GPAW approach where atom-centred PAW core corrections
+    provide the nuclear base and the smooth Hartree potential is subtracted.
     """
     ewald_gen = ewald_potential.generate_slices()
 
-    transform_valence_potential = None
+    transform_el = None
     if ewald_potential.plane != "xy":
         if not is_cell_orthogonal(atoms.cell):
             raise NotImplementedError(
                 "Non-orthogonal cells are not supported for non-xy planes."
             )
         axes = plane_to_axes(ewald_potential.plane)
-        valence_potential = np.moveaxis(valence_potential, axes[:2], (0, 1))
-        transform_valence_potential = False
+        electronic_potential = np.moveaxis(electronic_potential, axes[:2], (0, 1))
+        transform_el = False
 
     transformed_atoms = ewald_potential.get_transformed_atoms()
     if np.allclose(transformed_atoms.cell, atoms.cell):
-        transform_valence_potential = False
-    elif transform_valence_potential is None:
-        transform_valence_potential = True
+        transform_el = False
+    elif transform_el is None:
+        transform_el = True
 
     if last_slice is None:
         last_slice = len(ewald_potential)
@@ -368,9 +445,9 @@ def _generate_slices(
 
         a, b = ewald_potential.get_sliced_atoms().slice_limits[slice_idx]
 
-        if transform_valence_potential:
+        if transform_el:
             slic.array[:] -= _interpolate_slice(
-                valence_potential,
+                electronic_potential,
                 atoms.cell,
                 ewald_potential.gpts,
                 ewald_potential.sampling,
@@ -379,7 +456,7 @@ def _generate_slices(
             )
         else:
             slic.array[:] -= integrate_slice(
-                valence_potential,
+                electronic_potential,
                 ewald_potential.gpts,
                 a,
                 b,
@@ -430,9 +507,6 @@ class QEPotential(_PotentialBuilder):
         Super-cell repetitions applied before slicing (default ``(1,1,1)``).
     pp_command : str, optional
         Command used to invoke QE's ``pp.x`` (default ``'pp.x'``).
-    plot_num : int, optional
-        ``pp.x`` ``plot_num`` flag selecting which quantity to extract
-        (default ``11`` = total local potential).
     device : str, optional
         ``'cpu'`` or ``'gpu'``.
     """
@@ -451,7 +525,6 @@ class QEPotential(_PotentialBuilder):
         frozen_phonons: BaseFrozenPhonons = None,
         repetitions: Tuple[int, int, int] = (1, 1, 1),
         pp_command: str = "pp.x",
-        plot_num: int = 11,
         device: str = None,
     ):
         if Espresso is None:
@@ -462,8 +535,7 @@ class QEPotential(_PotentialBuilder):
             )
 
         self._pp_command = pp_command
-        self._plot_num = plot_num
-        qe_kwargs = dict(pp_command=pp_command, plot_num=plot_num)
+        qe_kwargs = dict(pp_command=pp_command)
 
         if isinstance(calculators, (tuple, list)):
             atoms = _read_atoms_qe(calculators[0])
@@ -531,10 +603,6 @@ class QEPotential(_PotentialBuilder):
     @property
     def pp_command(self):
         return self._pp_command
-
-    @property
-    def plot_num(self):
-        return self._plot_num
 
     @property
     def calculators(self):
@@ -611,7 +679,7 @@ class QEPotential(_PotentialBuilder):
         ewald_potential = self._get_ewald_potential(random_atoms)
 
         for slic in _generate_slices(
-            valence_potential=calculator.electrostatic_potential,
+            electronic_potential=calculator.electronic_potential,
             atoms=random_atoms,
             gpts=self.gpts,
             slice_thickness=self.slice_thickness,
