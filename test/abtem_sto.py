@@ -67,7 +67,21 @@ PSEUDOPOTENTIALS = {
 ENERGY = 200e3           # eV
 SAMPLING = 0.01          # Å  (potential grid)
 SLICE_THICKNESS = 1.0    # Å
-SUPERCELL_REP = (2, 2, 6)
+
+# QE is run on a 1×1×10 cell (1 primitive cell in XY, 10 in Z).
+# k-points (10,10,1) give equivalent sampling to 10×10×10 on the primitive cell.
+QE_CELL_REP = (1, 1, 10)  # supercell for the QE SCF run
+QE_KPTS = (10, 10, 1)     # k-point mesh for the QE supercell
+
+# The QEPotential tiles the DFT result to match the full multislice cell:
+QE_TILE_REP = (2, 2, 1)   # tile QE potential 2×2 in XY → same extent as IAM
+
+# IAM uses the equivalent full supercell (QE_CELL_REP × QE_TILE_REP in XY):
+SUPERCELL_REP = (
+    QE_CELL_REP[0] * QE_TILE_REP[0],
+    QE_CELL_REP[1] * QE_TILE_REP[1],
+    QE_CELL_REP[2],
+)  # = (2, 2, 10)
 
 # STEM probe
 SEMIANGLE_CUTOFF = 21.4  # mrad  (convergence semi-angle)
@@ -92,8 +106,9 @@ PTYCHO_ROI_SHAPE = (128, 128)
 
 def build_supercell():
     srtio3 = read(str(CIF_PATH))
-    repeated = srtio3 * SUPERCELL_REP
-    return srtio3, repeated
+    repeated = srtio3 * SUPERCELL_REP      # full IAM supercell
+    qe_cell  = srtio3 * QE_CELL_REP        # smaller cell for QE SCF
+    return srtio3, repeated, qe_cell
 
 
 def _potential_iam(atoms):
@@ -114,6 +129,7 @@ def _potential_qe(workdir):
         sampling=SAMPLING,
         slice_thickness=SLICE_THICKNESS,
         pp_command=QE_PP_COMMAND,
+        repetitions=QE_TILE_REP,
     )
 
 
@@ -251,7 +267,7 @@ def run_qe_scf(atoms, workdir="qe_sto_scf"):
             "etot_conv_thr": 1.0e-8,
             "forc_conv_thr": 1.0e-7,
             "verbosity": "low",
-            "disk_io": "low",
+            "disk_io": "medium",
         },
         "system": {
             "ibrav": 0,
@@ -267,7 +283,7 @@ def run_qe_scf(atoms, workdir="qe_sto_scf"):
         },
     }
 
-    kpts = (2,2,2)
+    kpts = QE_KPTS
 
     calc = Espresso(
         profile=profile,
@@ -553,9 +569,11 @@ def main():
 
     # --- Structure ---
     print("Reading SrTiO3 and building supercell …")
-    prim, supercell = build_supercell()
+    prim, supercell, qe_cell = build_supercell()
     print(f"  Primitive cell : {len(prim)} atoms")
-    print(f"  Supercell      : {len(supercell)} atoms  (rep = {SUPERCELL_REP})")
+    print(f"  IAM supercell  : {len(supercell)} atoms  (rep = {SUPERCELL_REP})")
+    print(f"  QE cell        : {len(qe_cell)} atoms  (rep = {QE_CELL_REP}, "
+          f"tiled {QE_TILE_REP} → net {SUPERCELL_REP})")
 
     # --- IAM potential ---
     iam_pot = _potential_iam(supercell)
@@ -576,7 +594,7 @@ def main():
     qe_pot = None
     if not args.iam_only:
         print(f"\n  --- QE SCF (workdir={args.workdir}) ---")
-        scf_atoms = run_qe_scf(supercell, workdir=args.workdir)
+        scf_atoms = run_qe_scf(qe_cell, workdir=args.workdir)
         print(f"  Total energy: {scf_atoms.get_potential_energy():.6f} eV")
 
         qe_pot = _potential_qe(args.workdir)
