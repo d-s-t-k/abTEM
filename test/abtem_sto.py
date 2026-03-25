@@ -70,10 +70,10 @@ SLICE_THICKNESS = 1.0    # Å
 
 # QE is run on the primitive cell with a dense 10×10×10 k-point mesh.
 QE_CELL_REP = (1, 1, 1)   # SCF on the primitive unit cell
-QE_KPTS = (10, 10, 10)    # dense k-mesh for the primitive cell
+QE_KPTS = (15, 15, 15)    # dense k-mesh for the primitive cell
 
 # QEPotential tiles the single-cell DFT result to build the multislice slab:
-QE_TILE_REP = (1, 1, 10)  # 1×1×10 slab for the electron beam to traverse
+QE_TILE_REP = (10, 10, 20)  # 10×10×20 slab for the electron beam to traverse
 
 # IAM supercell matches the tiled QE extent exactly:
 SUPERCELL_REP = (
