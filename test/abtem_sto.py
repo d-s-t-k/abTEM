@@ -406,6 +406,127 @@ def save_results(output_path, results):
 
 
 # ===================================================================
+# Phaser-compatible HDF5 export
+# ===================================================================
+
+def save_phaser_input(output_path, dataset_4d, label="", scan_end=None, prim=None):
+    """
+    Save a 4D-STEM dataset in an HDF5 layout suitable for ptychography codes
+    (phaser, py4DSTEM, PtychoShelves, etc.).
+
+    Layout
+    ------
+    /data/frames                – (Ny, Nx, det_y, det_x) float32 diffraction patterns
+    /data/frames_flat           – (Ny*Nx, det_y, det_x)  same data, flat scan axis
+    /scan/positions_angstrom    – (Ny*Nx, 2) real-space probe positions [x, y] in Å
+    /scan/shape                 – [Ny, Nx]
+    /scan/step_size_angstrom    – scalar
+    /instrument/energy_eV
+    /instrument/energy_keV
+    /instrument/wavelength_angstrom
+    /instrument/wavelength_pm
+    /instrument/convergence_semiangle_mrad
+    /detector/max_angle_mrad
+    /detector/pixel_size_mrad
+    /detector/pixel_size_inv_angstrom  – reciprocal-space calibration (1/Å per pixel)
+    /detector/shape
+    /sample/unit_cell_angstrom  – 3×3 cell matrix of the primitive cell (if provided)
+    """
+    from abtem.core.energy import energy2wavelength
+
+    arr = dataset_4d.array if hasattr(dataset_4d, "array") else np.asarray(dataset_4d)
+    # arr axes: (scan_y, scan_x, det_y, det_x)
+    n_scan_y, n_scan_x = arr.shape[:2]
+    det_shape = arr.shape[2:]
+
+    # --- wavelength ---
+    wavelength_ang = energy2wavelength(ENERGY)  # Å
+    wavelength_pm  = wavelength_ang * 100.0      # pm
+
+    # --- scan positions (regular grid) ---
+    if scan_end is not None:
+        xs = np.linspace(0.0, scan_end[0], n_scan_x, endpoint=False)
+        ys = np.linspace(0.0, scan_end[1], n_scan_y, endpoint=False)
+        xx, yy = np.meshgrid(xs, ys)
+        positions = np.stack([xx.ravel(), yy.ravel()], axis=-1)  # (N, 2)
+    else:
+        positions = None
+
+    # --- detector angular calibration ---
+    max_angle_mrad   = PTYCHO_MAX_ANGLE * SEMIANGLE_CUTOFF
+    # pixel size in mrad (detector is resampled to a uniform square grid)
+    det_pixel_mrad   = 2.0 * max_angle_mrad / det_shape[0]
+    # reciprocal-space calibration: q [1/Å] ≈ theta [mrad] / (wavelength [Å] * 1000)
+    det_pixel_inv_ang = (det_pixel_mrad * 1e-3) / wavelength_ang
+
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    with h5py.File(output_path, "w") as h5:
+        h5.attrs["creator"]     = "abtem_sto.py"
+        h5.attrs["label"]       = label
+        h5.attrs["description"] = (
+            "4D-STEM diffraction patterns + instrument metadata for ptychography. "
+            "Compatible with phaser, py4DSTEM, PtychoShelves."
+        )
+
+        # --- diffraction patterns ---
+        dp = arr.astype(np.float32)
+        ds = h5.create_dataset("data/frames", data=dp, compression="gzip",
+                               chunks=(1, 1, *det_shape))
+        ds.attrs["axes"]   = "scan_y, scan_x, det_y, det_x"
+        ds.attrs["shape"]  = list(dp.shape)
+        ds.attrs["units"]  = "electrons (relative intensity)"
+
+        ds_flat = h5.create_dataset("data/frames_flat",
+                                    data=dp.reshape(-1, *det_shape),
+                                    compression="gzip",
+                                    chunks=(1, *det_shape))
+        ds_flat.attrs["axes"]  = "scan_position, det_y, det_x"
+        ds_flat.attrs["shape"] = list(dp.reshape(-1, *det_shape).shape)
+
+        # --- scan ---
+        sg = h5.create_group("scan")
+        if positions is not None:
+            pd = sg.create_dataset("positions_angstrom", data=positions)
+            pd.attrs["units"]   = "angstrom"
+            pd.attrs["columns"] = "x, y"
+        sg.create_dataset("shape", data=[n_scan_y, n_scan_x])
+        sg.attrs["step_size_angstrom"] = PTYCHO_SCAN_STEP
+        sg.attrs["n_positions"]        = n_scan_y * n_scan_x
+
+        # --- instrument ---
+        ig = h5.create_group("instrument")
+        ig.attrs["energy_eV"]                   = float(ENERGY)
+        ig.attrs["energy_keV"]                  = float(ENERGY) / 1e3
+        ig.attrs["wavelength_angstrom"]         = float(wavelength_ang)
+        ig.attrs["wavelength_pm"]               = float(wavelength_pm)
+        ig.attrs["convergence_semiangle_mrad"]  = float(SEMIANGLE_CUTOFF)
+        ig.attrs["label"]                       = label
+
+        # --- detector ---
+        dg = h5.create_group("detector")
+        dg.attrs["max_angle_mrad"]           = float(max_angle_mrad)
+        dg.attrs["pixel_size_mrad"]          = float(det_pixel_mrad)
+        dg.attrs["pixel_size_inv_angstrom"]  = float(det_pixel_inv_ang)
+        dg.attrs["shape"]                    = list(det_shape)
+        dg.attrs["resampling"]               = "uniform"
+        dg.attrs["note"] = (
+            "Detector covers ±max_angle_mrad with uniform angular sampling. "
+            "pixel_size_inv_angstrom = pixel_size_mrad*1e-3 / wavelength_angstrom."
+        )
+
+        # --- sample / unit cell ---
+        if prim is not None:
+            sg2 = h5.create_group("sample")
+            cell_ds = sg2.create_dataset("unit_cell_angstrom",
+                                         data=np.array(prim.cell))
+            cell_ds.attrs["units"]       = "angstrom"
+            cell_ds.attrs["description"] = "3x3 row-vector cell matrix of primitive cell"
+            sg2.attrs["formula"] = prim.get_chemical_formula()
+
+    print(f"  Phaser input saved to {output_path}")
+
+
+# ===================================================================
 # Plotting
 # ===================================================================
 
@@ -561,6 +682,10 @@ def main():
         "--no-plots", action="store_true",
         help="Suppress matplotlib figures.",
     )
+    parser.add_argument(
+        "--phaser-dir", default="phaser_input",
+        help="Directory for phaser-compatible HDF5 files (default: phaser_input).",
+    )
     args = parser.parse_args()
 
     results = {"haadf": {}, "4dstem": {}, "rpie": {}, "potential": {}}
@@ -619,6 +744,11 @@ def main():
         print("  --- IAM ---")
         ds4d_iam = run_4dstem(iam_pot, label="IAM", scan_end=scan_end)
         results["4dstem"]["iam"] = ds4d_iam
+
+        phaser_iam = os.path.join(args.phaser_dir, "phaser_iam.h5")
+        save_phaser_input(phaser_iam, ds4d_iam, label="IAM",
+                          scan_end=scan_end, prim=prim)
+
         obj_iam, prb_iam, pos_iam, sse_iam = run_rpie(ds4d_iam, label="IAM")
         results["rpie"]["iam"] = (obj_iam, prb_iam, pos_iam, sse_iam)
 
@@ -626,6 +756,11 @@ def main():
             print("  --- QE ---")
             ds4d_qe = run_4dstem(qe_pot, label="QE", scan_end=scan_end)
             results["4dstem"]["qe"] = ds4d_qe
+
+            phaser_qe = os.path.join(args.phaser_dir, "phaser_qe.h5")
+            save_phaser_input(phaser_qe, ds4d_qe, label="QE",
+                              scan_end=scan_end, prim=prim)
+
             obj_qe, prb_qe, pos_qe, sse_qe = run_rpie(ds4d_qe, label="QE")
             results["rpie"]["qe"] = (obj_qe, prb_qe, pos_qe, sse_qe)
 
