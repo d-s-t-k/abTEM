@@ -136,7 +136,7 @@ def _potential_qe(workdir):
 # HAADF-STEM
 # ===================================================================
 
-def run_haadf(potential, label=""):
+def run_haadf(potential, label="", scan_end=None):
     """Run a HAADF-STEM scan and return the image (Images object)."""
     probe = Probe(
         energy=ENERGY,
@@ -146,16 +146,15 @@ def run_haadf(potential, label=""):
 
     detector = AnnularDetector(inner=HAADF_INNER, outer=HAADF_OUTER)
 
-    cell = potential.box if hasattr(potential, "box") and potential.box else None
-    # Build a grid scan covering the full supercell
-    if cell is not None:
-        end = (cell[0], cell[1])
-    else:
-        end = (potential.extent[0], potential.extent[1])
+    if scan_end is None:
+        cell = potential.box if hasattr(potential, "box") and potential.box else None
+        scan_end = (cell[0], cell[1]) if cell is not None else (
+            potential.extent[0], potential.extent[1]
+        )
 
     scan = GridScan(
         start=(0, 0),
-        end=end,
+        end=scan_end,
         sampling=SCAN_STEP,
     )
 
@@ -176,7 +175,7 @@ def run_haadf(potential, label=""):
 # 4D-STEM + Ptychography (rPIE)
 # ===================================================================
 
-def run_4dstem(potential, label=""):
+def run_4dstem(potential, label="", scan_end=None):
     """Collect a 4D-STEM dataset suitable for ptychographic reconstruction."""
     probe = Probe(
         energy=ENERGY,
@@ -190,15 +189,15 @@ def run_4dstem(potential, label=""):
         resample="uniform",
     )
 
-    cell = potential.box if hasattr(potential, "box") and potential.box else None
-    if cell is not None:
-        end = (cell[0], cell[1])
-    else:
-        end = (potential.extent[0], potential.extent[1])
+    if scan_end is None:
+        cell = potential.box if hasattr(potential, "box") and potential.box else None
+        scan_end = (cell[0], cell[1]) if cell is not None else (
+            potential.extent[0], potential.extent[1]
+        )
 
     scan = GridScan(
         start=(0, 0),
-        end=end,
+        end=scan_end,
         sampling=PTYCHO_SCAN_STEP,
     )
 
@@ -574,6 +573,12 @@ def main():
     print(f"  QE cell        : {len(qe_cell)} atoms  (rep = {QE_CELL_REP}, "
           f"tiled {QE_TILE_REP} → net {SUPERCELL_REP})")
 
+    # Scan covers exactly 1 primitive unit cell in XY
+    uc_a = float(prim.cell[0, 0])  # Å
+    uc_b = float(prim.cell[1, 1])  # Å
+    scan_end = (uc_a, uc_b)
+    print(f"  Scan end (1 unit cell) : {scan_end[0]:.4f} × {scan_end[1]:.4f} Å")
+
     # --- IAM potential ---
     iam_pot = _potential_iam(supercell)
 
@@ -588,7 +593,7 @@ def main():
     # ================= HAADF =================
     print("\n===== HAADF-STEM =====")
     print("  --- IAM (Lobato) ---")
-    results["haadf"]["iam"] = run_haadf(iam_pot, label="IAM")
+    results["haadf"]["iam"] = run_haadf(iam_pot, label="IAM", scan_end=scan_end)
 
     qe_pot = None
     if not args.iam_only:
@@ -605,21 +610,21 @@ def main():
               f"{float(qe_proj.array.max()):.2f}] eV/e")
 
         print("  --- QE ---")
-        results["haadf"]["qe"] = run_haadf(qe_pot, label="QE")
+        results["haadf"]["qe"] = run_haadf(qe_pot, label="QE", scan_end=scan_end)
 
     # ================= PTYCHOGRAPHY =================
     if not args.skip_ptycho:
         print("\n===== 4D-STEM + Ptychography (rPIE) =====")
 
         print("  --- IAM ---")
-        ds4d_iam = run_4dstem(iam_pot, label="IAM")
+        ds4d_iam = run_4dstem(iam_pot, label="IAM", scan_end=scan_end)
         results["4dstem"]["iam"] = ds4d_iam
         obj_iam, prb_iam, pos_iam, sse_iam = run_rpie(ds4d_iam, label="IAM")
         results["rpie"]["iam"] = (obj_iam, prb_iam, pos_iam, sse_iam)
 
         if qe_pot is not None:
             print("  --- QE ---")
-            ds4d_qe = run_4dstem(qe_pot, label="QE")
+            ds4d_qe = run_4dstem(qe_pot, label="QE", scan_end=scan_end)
             results["4dstem"]["qe"] = ds4d_qe
             obj_qe, prb_qe, pos_qe, sse_qe = run_rpie(ds4d_qe, label="QE")
             results["rpie"]["qe"] = (obj_qe, prb_qe, pos_qe, sse_qe)
