@@ -20,6 +20,7 @@ from ase.io.cube import read_cube_data
 
 from abtem.atoms import is_cell_orthogonal, plane_to_axes
 from abtem.core.axes import AxisMetadata
+from abtem.core.backend import get_array_module
 from abtem.core.ensemble import _wrap_with_array
 from abtem.core.fft import fft_crop
 from abtem.core.utils import itemset
@@ -268,6 +269,8 @@ def integrate_slice(array, gpts, a, b, thickness):
     slice_array = np.sum(array[..., na:nb], axis=-1) * dz
     new_shape = (nb - na,) + gpts
     old_shape = (nb - na,) + slice_array.shape
+    if np.prod(old_shape) == 0:
+        return np.zeros(gpts, dtype=array.dtype)
     slice_array = np.fft.fftn(slice_array)
     slice_array = fft_crop(slice_array, gpts)
     slice_array = (
@@ -446,22 +449,24 @@ def _generate_slices(
         a, b = ewald_potential.get_sliced_atoms().slice_limits[slice_idx]
 
         if transform_el:
-            slic.array[:] -= _interpolate_slice(
+            xp = get_array_module(slic.array)
+            slic.array[:] -= xp.asarray(_interpolate_slice(
                 electronic_potential,
                 atoms.cell,
                 ewald_potential.gpts,
                 ewald_potential.sampling,
                 a,
                 b,
-            )
+            ))
         else:
-            slic.array[:] -= integrate_slice(
+            xp = get_array_module(slic.array)
+            slic.array[:] -= xp.asarray(integrate_slice(
                 electronic_potential,
                 ewald_potential.gpts,
                 a,
                 b,
                 ewald_potential.thickness,
-            )
+            ))
 
         yield slic
 
