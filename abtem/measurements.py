@@ -2427,7 +2427,7 @@ def _diffraction_pattern_resampling_gpts(
             gpts = (gpts,) * 2
 
         validated_sampling = tuple(
-            d * old_n / new_n for d, old_n, new_n in zip(sampling, old_gpts, gpts)
+            d * old_n / new_n for d, old_n, new_n in zip(old_sampling, old_gpts, gpts)
         )
 
     return gpts, validated_sampling
